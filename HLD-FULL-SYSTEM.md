@@ -145,6 +145,7 @@ A **Kafka-native delivery pipeline** that accepts pre-validated events from Comm
 - **Dispatch Pipeline**: `comms-input → event → dispatch → HTTP to provider`
 - **DLR Pipeline**: `HTTP POST from provider → raw-dlr → enriched-dlr → analytics`
 
+
 ---
 
 ## 4. Full System Architecture Diagram
@@ -237,7 +238,7 @@ flowchart TD
     TV -.->|"Kafka: channel topics\n(sms/eml/wa/rcs/push_nrt_svc_valgov)"| RC
 
     %% Bummlebee Dispatch
-    RC -->|"Kafka: event"| VG
+    RC -->|"Kafka: valgov input topic"| VG
     VG -->|"DLT API"| DLT_API
     VG -->|"CMS quota check"| CMS_API
     VG -->|"Kafka: dispatch"| ORCH
