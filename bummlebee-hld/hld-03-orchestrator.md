@@ -23,56 +23,131 @@
 
 ## 2. High-Level Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR SERVICE  (port: 8080, Kafka-driven, no REST)             │
-│                                                                                          │
-│  KafkaConsumer                                                                           │
-│  @KafkaListener(topics=dispatch, groupId=dispatch-request-consumer-group, concurrency=4) │
-│  ┌───────────────────────────────────────────────────────────────────────────────────┐   │
-│  │                                                                                   │   │
-│  │  1. objectMapper.readTree(msg)  → JsonNode                                       │   │
-│  │  2. Extract eventRequest node  → uuid + MDC.put(traceId, requestId)             │   │
-│  │  3. Null check on eventRequest → publishError(EMPTY_REQUEST) if missing         │   │
-│  │  4. timeValidationService.isExpired(json)?                                      │   │
-│  │       ├── YES → handleExpiredMessage()                                           │   │
-│  │       │          ├── cmsRequired? → cmsService.decrementQuota(TIME_VALIDATION)  │   │
-│  │       │          └── responseKafkaPublisher.publishErrorResponse(410)           │   │
-│  │       └── NO  → routeMessage(uuid, json)                                        │   │
-│  │                                                                                   │   │
-│  │  routeMessage() — first enabled channel wins (feature flag per instance):        │   │
-│  │    smsEnabled?      → smsService.send(payload)                                   │   │
-│  │    emailEnabled?    → emailService.send(payload)                                 │   │
-│  │    waEnabled?       → whatsAppService.send(payload)                              │   │
-│  │    pushEnabled?     → pushService.send(payload)                                  │   │
-│  │    smsLobbyEnabled? → smsLobbyService.send(payload)                             │   │
-│  │    rcsEnabled?      → rcsService.send(payload)                                   │   │
-│  │    none enabled     → publishError(NO_CHANNEL_ENABLED)                          │   │
-│  └───────────────────────────────────────────────────────────────────────────────┬─┘   │
-│                                                                                   │     │
-│  BaseChannelService  (Template Method Pattern)                                    │     │
-│  ┌──────────────────────────────────────────────────────────────────────────┐     │     │
-│  │  send(payload)                                                           │     │     │
-│  │    ├── providerRetryService.execute(payload, () → sendToProvider())     │     │     │
-│  │    │     └─ on FeignException → handleFailure()                        │     │     │
-│  │    │           ├── cmsRequired? → cmsService.decrementQuota()          │     │     │
-│  │    │           └── responseKafkaPublisher.publishErrorResponse()       │     │     │
-│  │    └── SUCCESS → responseKafkaPublisher.publishSuccessResponse()       │     │     │
-│  └──────────────────────────────────────────────────────────────────────────┘     │     │
-│                                                                                   │     │
-│  ResponseKafkaPublisher ◄──────────────────────────────────────────────────────────┘     │
-│    ├── fullDmlBuilder.buildFullKafkaDml(payload, response)                               │
-│    ├── PublishStrategyFactory.getStrategy(publishMode)                                   │
-│    │     ├── FULL_ONLY  → FullDmlKafkaPublisher  dispatch-response / error topic         │
-│    │     ├── APB_ONLY   → ApbKafkaPublisher      apb-success-log / apb-log              │
-│    │     └── BOTH       → BothPublishStrategy    both sets of topics                    │
-│    └── analyticsEventBuilder → analyticsEventPublisher → analytics topic                │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
-                │                       │                         │
-    ┌───────────▼──────┐    ┌───────────▼──────────┐  ┌──────────▼──────────┐
-    │  dispatch-response│    │  apb-success-log /   │  │  analytics topic    │
-    │  (error topic)   │    │  apb-log             │  │                     │
-    └──────────────────┘    └──────────────────────┘  └─────────────────────┘
+```mermaid
+flowchart TB
+    DT(["📨 Kafka: dispatch topic\ngroup: dispatch-request-consumer-group\nconcurrency: 4"])
+
+    subgraph ORCH["uclm-orchestrator-service  ·  port 8080  ·  Kafka-driven, no REST"]
+        direction TB
+
+        subgraph KCG["① KafkaConsumer  @KafkaListener"]
+            direction TB
+            PARSE["Parse JSON\nobjectMapper.readTree()"]
+            TRACE["Extract uuid\nMDC.put(traceId, requestId)"]
+            NULL{eventRequest\nnull?}
+            TV{expire_timestamp\nexpired?}
+            EXP_H["handleExpiredMessage()\ncmsRequired? → decrementQuota()\npublishErrorResponse(410)"]
+            ROUTE["routeMessage()\nfirst-enabled flag wins"]
+        end
+
+        subgraph CHN["② Channel Routing — only ONE flag active per deployed pod"]
+            direction LR
+            SVC_SMS["SmsService\nSMS IQ"]
+            SVC_EMAIL["EmailService\nNetcore / SMTP"]
+            SVC_WA["WhatsAppService\nAirtel IQ WA"]
+            SVC_PUSH["PushService\nFCM"]
+            SVC_LOBBY["SmsLobbyService\nSMS Lobby"]
+            SVC_RCS["RcsService\nRCS IQ"]
+        end
+
+        subgraph BASE["③ BaseChannelService — Template Method"]
+            direction TB
+            RETRY_W["ProviderRetryService\nmaxAttempts=3 · backoff 1s×2.0 · max 10s"]
+            OK_P["handleSuccess()"]
+            FAIL_P["handleFailure()\ncmsRequired? → cmsService.decrementQuota(PROVIDER_FAILED)"]
+        end
+
+        CMS_SVC["CmsService\nPOST /counter/decrement · Bearer token"]
+        HZ["Hazelcast In-Memory Lookup\nAccount creds by sender_id\nAccountContextHolder ThreadLocal"]
+
+        subgraph PIPELINE["④ Response Publishing Pipeline"]
+            direction LR
+            RP_PUB["ResponseKafkaPublisher"]
+            FDB["FullDmlBuilder\nbuildFullKafkaDml()"]
+            PSF_N["PublishStrategyFactory\nFULL_ONLY / APB_ONLY / BOTH"]
+            ANA_B["AnalyticsEventBuilder\n+ AnalyticsEventPublisher async"]
+            FULL_K["FullDmlKafkaPublisher\nasync"]
+            APB_K["ApbKafkaPublisher\n+ ApbContractBuilder async"]
+        end
+    end
+
+    subgraph EXT["External Channel Providers — Spring Cloud OpenFeign"]
+        direction LR
+        E_SMS["Airtel SMS IQ\nPOST /api/v1/send-sms\nBasic auth"]
+        E_EMAIL["Netcore CPaaS\nPOST /v5.1/mail/send  x-api-key\nOR  SMTP / JavaMail"]
+        E_WA["Airtel IQ WhatsApp\nPOST /api/v2/message/nc\nBearer token"]
+        E_PUSH["Firebase FCM\nOAuth2 client creds"]
+        E_RCS["Airtel IQ Conversation\nPOST .../rcs/message/send\nBasic auth"]
+        E_CMS["CMS Service\nPOST /counter/decrement\nBearer token"]
+    end
+
+    T_SUCC(["✅ dispatch-response\nsuccess topic"])
+    T_ERR(["❌ error topic\nfailure responses"])
+    T_APB_S(["apb-success-log"])
+    T_APB_E(["apb-log"])
+    T_ANA(["analytics topic"])
+    T_EX(["orchestrator-exceptions\ndeserialization / unhandled errors"])
+
+    DT --> PARSE
+    PARSE --> TRACE --> NULL
+    NULL -->|"yes → EMPTY_REQUEST"| T_ERR
+    NULL -->|no| TV
+    TV -->|expired| EXP_H
+    TV -->|valid| ROUTE
+
+    EXP_H --> CMS_SVC
+    EXP_H --> RP_PUB
+
+    ROUTE -->|smsEnabled| SVC_SMS
+    ROUTE -->|emailEnabled| SVC_EMAIL
+    ROUTE -->|waEnabled| SVC_WA
+    ROUTE -->|pushEnabled| SVC_PUSH
+    ROUTE -->|smsLobbyEnabled| SVC_LOBBY
+    ROUTE -->|rcsEnabled| SVC_RCS
+    ROUTE -->|"none enabled"| T_ERR
+
+    SVC_SMS & SVC_EMAIL & SVC_WA & SVC_PUSH & SVC_LOBBY & SVC_RCS --> RETRY_W
+    SVC_SMS -.->|Feign| E_SMS
+    SVC_EMAIL -.->|Feign| E_EMAIL
+    SVC_WA -.->|Feign| E_WA
+    SVC_WA -.->|account lookup| HZ
+    SVC_PUSH -.->|Feign| E_PUSH
+    SVC_RCS -.->|Feign| E_RCS
+
+    RETRY_W -->|2xx| OK_P
+    RETRY_W -->|"4xx/5xx after retries"| FAIL_P
+    FAIL_P --> CMS_SVC
+    CMS_SVC -.->|Feign| E_CMS
+
+    OK_P --> RP_PUB
+    FAIL_P --> RP_PUB
+
+    RP_PUB --> FDB --> PSF_N
+    PSF_N -->|FULL_ONLY| FULL_K
+    PSF_N -->|APB_ONLY| APB_K
+    PSF_N -->|BOTH| FULL_K & APB_K
+    RP_PUB --> ANA_B
+
+    FULL_K --> T_SUCC
+    FULL_K --> T_ERR
+    APB_K --> T_APB_S
+    APB_K --> T_APB_E
+    ANA_B --> T_ANA
+    DT -->|"DeserializationException / unhandled"| T_EX
+
+    classDef kafka fill:#f39c12,color:#000,stroke:#d68910
+    classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
+    classDef db fill:#27ae60,color:#fff,stroke:#1e8449
+    classDef channel fill:#d35400,color:#fff,stroke:#a04000
+    classDef user fill:#34495e,color:#fff,stroke:#2c3e50
+    classDef stop fill:#e74c3c,color:#fff,stroke:#c0392b
+
+    class DT,T_SUCC,T_ERR,T_APB_S,T_APB_E,T_ANA,T_EX kafka
+    class E_SMS,E_EMAIL,E_WA,E_PUSH,E_RCS,E_CMS channel
+    class SVC_SMS,SVC_EMAIL,SVC_WA,SVC_PUSH,SVC_LOBBY,SVC_RCS,RETRY_W,RP_PUB,PSF_N,FULL_K,APB_K svc
+    class CMS_SVC,HZ,OK_P db
+    class PARSE,TRACE,ROUTE,FDB,ANA_B user
+    class NULL,TV,EXP_H,FAIL_P stop
 ```
 
 ---
@@ -227,20 +302,42 @@ flowchart TB
 
 All channel services extend `BaseChannelService` which provides the common lifecycle:
 
-```
-BaseChannelService.send(JsonNode payload)
-│
-├── Log: "Channel={name} processing request uuid={uuid}"
-├── providerRetryService.execute(payload, () → sendToProvider(payload))
-│     │
-│     ├── SUCCESS → handleSuccess(payload, response, statusCode)
-│     │               └── responseKafkaPublisher.publishSuccessResponse(...)
-│     │
-│     └── FeignException (after max retries) → handleFailure(payload, error, statusCode, response)
-│                                                 ├── cmsRequired? → cmsService.decrementQuota(PROVIDER_FAILED)
-│                                                 └── responseKafkaPublisher.publishErrorResponse(...)
-│
-└── Log latency in ms
+```mermaid
+flowchart TD
+    ENTRY["BaseChannelService.send(JsonNode payload)"]
+    LOG1["Log: Channel={name} processing uuid={uuid}\nstart = System.currentTimeMillis()"]
+    RETRY["ProviderRetryService.execute(payload, sendToProvider)\n@Retry name=providerRetry"]
+    ABSTRACT["sendToProvider(payload)\nAbstract — implemented by each subclass:\nSmsService · EmailService · WhatsAppService\nPushService · RcsService · SmsLobbyService"]
+    PROV{Provider\nresponse?}
+    RETRY_AGAIN["Retry with exponential backoff\nattempts 1 → 2 → 3"]
+    SUCCESS["handleSuccess(payload, response, statusCode)\nLog: completed in latency ms"]
+    PUB_SUCC["responseKafkaPublisher\n.publishSuccessResponse()"]
+    FEIGN_EX["FeignException — retries exhausted\nLog: failed after latency ms with status=N"]
+    FAIL["handleFailure(payload, error, statusCode, response)"]
+    CMS_CHK{cmsRequired?}
+    CMS_DECR["cmsService.decrementQuota\n(payload, PROVIDER_FAILED)"]
+    PUB_ERR["responseKafkaPublisher\n.publishErrorResponse()"]
+
+    ENTRY --> LOG1 --> RETRY --> ABSTRACT --> PROV
+    PROV -->|"HTTP 2xx"| SUCCESS --> PUB_SUCC
+    PROV -->|"5xx / conn error"| RETRY_AGAIN --> RETRY
+    PROV -->|"4xx — not retried"| FEIGN_EX
+    PROV -->|"retries exhausted"| FEIGN_EX
+    FEIGN_EX --> FAIL --> CMS_CHK
+    CMS_CHK -->|yes| CMS_DECR --> PUB_ERR
+    CMS_CHK -->|no| PUB_ERR
+
+    classDef kafka fill:#f39c12,color:#000,stroke:#d68910
+    classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
+    classDef db fill:#27ae60,color:#fff,stroke:#1e8449
+    classDef user fill:#34495e,color:#fff,stroke:#2c3e50
+    classDef stop fill:#e74c3c,color:#fff,stroke:#c0392b
+
+    class PUB_SUCC,PUB_ERR kafka
+    class RETRY,ABSTRACT,RETRY_AGAIN svc
+    class CMS_DECR,SUCCESS db
+    class ENTRY,LOG1,FAIL user
+    class FEIGN_EX,CMS_CHK,PROV stop
 ```
 
 | Abstract Method | Description |
@@ -436,27 +533,43 @@ flowchart TB
 
 ## 9. CMS Integration
 
-```
-CmsClient (Feign) → POST ${app.cms.api.base-url}/counter/decrement
-Headers: Authorization: Bearer ${app.cms.api.auth-token}
-         tenant_id, dept_id, user_id
+```mermaid
+flowchart TD
+    TRIGGER["CmsService.decrementQuota(payload, reason)\nCalled on: ① expiry  ② provider failure"]
+    EXTRACT["Extract uuid from eventRequest\nExtract CmsDecrementRequest from payload.cmsRequest\n(pre-built by Validation-Governance)"]
+    FEIGN["CmsClient Feign\nPOST /counter/decrement\nHeaders: Authorization: Bearer token\ntenant_id · dept_id · user_id"]
+    CMS_EXT[("CMS Service\nexternal")]
+    RESP{CmsDecrementResponse\nstatus?}
+    SUCC["Log: CMS decrement successful\nreturn SUCCESS JSON"]
+    BIZ_FAIL["Log: CMS business error\nreturn FAILURE JSON with reason"]
+    FEIGN_EX["FeignException\nLog error\nreturn FAILURE JSON"]
+    GEN_EX["Generic Exception\nLog error\nreturn FAILURE JSON"]
+    MAIN_FLOW["Main flow continues\nCMS response appended to FullKafkaDml\nDoes NOT block or fail the dispatch"]
 
-Request payload: CmsDecrementRequest
-  (extracted from payload.cmsRequest — pre-built by Validation-Governance)
+    TRIGGER --> EXTRACT --> FEIGN
+    FEIGN -.->|HTTP POST| CMS_EXT
+    CMS_EXT -.->|response| RESP
+    RESP -->|SUCCESS| SUCC
+    RESP -->|FAILURE| BIZ_FAIL
+    FEIGN -->|FeignException| FEIGN_EX
+    FEIGN -->|Exception| GEN_EX
+    SUCC --> MAIN_FLOW
+    BIZ_FAIL --> MAIN_FLOW
+    FEIGN_EX --> MAIN_FLOW
+    GEN_EX --> MAIN_FLOW
 
-Response: CmsServiceResponse<CmsDecrementResponse> {
-  data: {
-    status: SUCCESS | FAILURE
-    reason: "string"
-    communication: ALLOWED | NOT_ALLOWED
-  }
-}
+    classDef kafka fill:#f39c12,color:#000,stroke:#d68910
+    classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
+    classDef db fill:#27ae60,color:#fff,stroke:#1e8449
+    classDef channel fill:#d35400,color:#fff,stroke:#a04000
+    classDef user fill:#34495e,color:#fff,stroke:#2c3e50
+    classDef stop fill:#e74c3c,color:#fff,stroke:#c0392b
 
-Called on:
-  ① Time validation failure  (if cmsRequired=true in eventRequest)
-  ② Provider failure after retries (if cmsRequired=true in eventRequest)
-
-On CMS Feign exception → logs error, returns FAILURE JSON, does NOT fail the main flow
+    class CMS_EXT channel
+    class TRIGGER,EXTRACT,FEIGN svc
+    class SUCC,MAIN_FLOW db
+    class BIZ_FAIL,FEIGN_EX,GEN_EX stop
+    class RESP user
 ```
 
 ---
@@ -510,6 +623,41 @@ flowchart TB
 
 `FullDmlBuilder.buildFullKafkaDml()` maps request + provider response into a unified DML record:
 
+```mermaid
+flowchart TD
+    IN["buildFullKafkaDml\n(requestPayload JsonNode, responsePayload ResponseEntity)"]
+    NULL_CHK{requestPayload\nnull?}
+    MINIMAL["Return minimal FullKafkaDml\nstatus=FAILED · error_code=4109\nerror_message=Invalid or missing request payload"]
+    EXTRACT_ER["Extract eventRequest node\nConvert to EventRequest POJO\n(objectMapper.convertValue)"]
+    EXTRACT_RESP["Parse responsePayload.body → JsonNode\n(skip if smsLobbyEnabled or SMTP email)"]
+    EXTRACT_ID["Extract endpointRequestId per MOC\nsms / whatsapp / rcs → messageReqId\nemail → data.messageId\npush_bank / push_thanks → data.tid"]
+    BUILD["Build FullKafkaDml builder\n① Campaign: name, group, type, category, lob, si_id, moc\n② Timestamps: source, start, expiry, dashboard\n③ Content: script_body, script_sub, msg_lng_cd\n④ Tracking: uuid, circle_id, email_id, workspace_id\n⑤ Lists: dynmc_prm, dynmc_prm_sub, additional_fields\n⑥ Meta: module_name=orchestrator-service, event_date, input_topic\n⑦ msg_typ_cd from additional_fields[template_id]"]
+    STATUS["Caller sets:\nstatus = SUCCESS or FAILED\nerror_code, error_message"]
+    RESP_MAP["response_data = Map moc → responsePayload\nendpoint_request_id = extracted above"]
+    OUT(["FullKafkaDml ready\n→ PublishModeStrategy.publishSuccess/Error()"])
+
+    IN --> NULL_CHK
+    NULL_CHK -->|yes| MINIMAL
+    NULL_CHK -->|no| EXTRACT_ER
+    EXTRACT_ER --> EXTRACT_RESP
+    EXTRACT_RESP --> EXTRACT_ID
+    EXTRACT_ID --> BUILD
+    BUILD --> STATUS
+    STATUS --> RESP_MAP --> OUT
+
+    classDef kafka fill:#f39c12,color:#000,stroke:#d68910
+    classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
+    classDef db fill:#27ae60,color:#fff,stroke:#1e8449
+    classDef user fill:#34495e,color:#fff,stroke:#2c3e50
+    classDef stop fill:#e74c3c,color:#fff,stroke:#c0392b
+
+    class OUT kafka
+    class IN,EXTRACT_ER,EXTRACT_RESP,EXTRACT_ID,BUILD svc
+    class STATUS,RESP_MAP db
+    class NULL_CHK user
+    class MINIMAL stop
+```
+
 | Field Group | Source | Fields |
 |-------------|--------|--------|
 | **Campaign metadata** | `eventRequest` | `campaign_group`, `campaign_name`, `campaign_type`, `category`, `lob`, `si_id`, `moc` |
@@ -552,24 +700,47 @@ flowchart TB
 
 ## 13. Time Validation Logic
 
-```
-TimeValidationService.isExpired(payload)
+```mermaid
+flowchart TD
+    START["TimeValidationService.isExpired(payload)"]
+    CHK_EN{app.time.validation\n.enabled = true?}
+    SKIP_EN["return false\nvalidation disabled — skip"]
+    EXTRACT["Extract expire_timestamp\nfrom eventRequest node"]
+    CHK_BLANK{timestamp\nblank or null?}
+    SKIP_BLANK["return false\nno expiry configured"]
+    TRY_DT["Try 8 datetime formats in order:\nyyyy-MM-dd HH:mm:ss.SSSSSS\nyyyy-MM-dd HH:mm:ss.SSS\nyyyy-MM-dd HH:mm:ss\nyyyy-MM-dd'T'HH:mm:ss.SSSSSS\nyyyy-MM-dd'T'HH:mm:ss.SSS\nyyyy-MM-dd'T'HH:mm:ss\nyyyy/MM/dd HH:mm:ss\ndd-MM-yyyy HH:mm:ss"]
+    TRY_DO["Try date-only formats:\nyyyy-MM-dd · yyyy/MM/dd · dd-MM-yyyy\n→ treat as end-of-day 23:59:59"]
+    CHK_PARSE{parse\nsucceeded?}
+    WARN_LOG["Log WARN: unparseable timestamp\nreturn false — treat as not expired"]
+    NOW["now = LocalDateTime.now\n(ZoneId: Asia/Kolkata)"]
+    CHK_EXP{now.isAfter\n(expiry)?}
+    EXPIRED["return true — EXPIRED\n→ handleExpiredMessage():\n  CMS decrement if cmsRequired\n  publishErrorResponse(410)"]
+    VALID["return false — VALID\n→ routeMessage()"]
 
-1. if app.time.validation.enabled == false → return false (skip)
-2. Extract expire_timestamp from eventRequest
-3. if blank → return false (no expiry set)
-4. Parse with multi-format list (in order):
-     "yyyy-MM-dd HH:mm:ss.SSSSSS"   (microseconds)
-     "yyyy-MM-dd HH:mm:ss.SSS"      (milliseconds)
-     "yyyy-MM-dd HH:mm:ss"
-     "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
-     "yyyy-MM-dd'T'HH:mm:ss.SSS"
-     "yyyy-MM-dd'T'HH:mm:ss"
-     "yyyy/MM/dd HH:mm:ss"
-     "dd-MM-yyyy HH:mm:ss"
-     Date-only formats → treat as end of day (23:59:59)
-5. now = LocalDateTime.now(ZoneId.of("Asia/Kolkata"))
-6. return now.isAfter(expiry)   [exact match is NOT expired]
+    START --> CHK_EN
+    CHK_EN -->|false| SKIP_EN
+    CHK_EN -->|true| EXTRACT
+    EXTRACT --> CHK_BLANK
+    CHK_BLANK -->|blank| SKIP_BLANK
+    CHK_BLANK -->|present| TRY_DT
+    TRY_DT --> TRY_DO --> CHK_PARSE
+    CHK_PARSE -->|failed all formats| WARN_LOG
+    CHK_PARSE -->|succeeded| NOW
+    NOW --> CHK_EXP
+    CHK_EXP -->|"yes — now > expiry"| EXPIRED
+    CHK_EXP -->|"no — now ≤ expiry"| VALID
+
+    classDef kafka fill:#f39c12,color:#000,stroke:#d68910
+    classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
+    classDef db fill:#27ae60,color:#fff,stroke:#1e8449
+    classDef user fill:#34495e,color:#fff,stroke:#2c3e50
+    classDef stop fill:#e74c3c,color:#fff,stroke:#c0392b
+
+    class EXPIRED stop
+    class VALID,SKIP_EN,SKIP_BLANK db
+    class START,EXTRACT,TRY_DT,TRY_DO,NOW svc
+    class CHK_EN,CHK_BLANK,CHK_PARSE,CHK_EXP user
+    class WARN_LOG kafka
 ```
 
 On expiry:
