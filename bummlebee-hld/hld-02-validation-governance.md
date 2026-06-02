@@ -370,15 +370,15 @@ Iterates over Spring-injected `List<Action>` ordered by `@Order`. Each `Action` 
 ```mermaid
 flowchart TD
     D["decide()"]
-    D -->|MOC != SMS| SKIP["skip → false"]
+    D -->|MOC != SMS| SKIP["skip — false"]
     D -->|sms.provider == IQ| SKIP
     D -->|SMS + non-IQ + category in list| RUN["invoke()"]
 
-    RUN --> BUILD["DltRequestBuilder.build(ctx)\n{accountId, entityId, tmid, templateId, mobile, message}"]
-    BUILD --> CALL["POST {dlt.url}\nAuthorization: Basic base64(user:pass)\nContent-Type: application/json"]
-    CALL -->|200 + scrubResult==true| OK["state.dltPassed=true\nctx.dltResponse stored\nctx.dltResponseTime set"]
-    CALL -->|200 + scrubResult==false| ERR["DltToCustomErrorMapper.map(statusCode)\nthrow GenericException(DltErrorCode)"]
-    CALL -->|HttpStatusCodeException| FAIL["throw GenericException(DLT_CALL_FAILED 4057)"]
+    RUN --> BUILD["DltRequestBuilder.build\naccountId, entityId, tmid, templateId, mobile, message"]
+    BUILD --> CALL["POST dlt.url\nAuthorization: Basic base64 user:pass\nContent-Type: application/json"]
+    CALL -->|200 and scrubResult==true| OK["state.dltPassed=true\nctx.dltResponse stored\nctx.dltResponseTime set"]
+    CALL -->|200 and scrubResult==false| ERR["DltToCustomErrorMapper.map\nthrow GenericException DltErrorCode"]
+    CALL -->|HttpStatusCodeException| FAIL["throw GenericException DLT_CALL_FAILED 4057"]
 
     classDef ext fill:#8e44ad,color:#fff,stroke:#6c3483
     classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
@@ -407,17 +407,17 @@ flowchart TD
 ```mermaid
 flowchart TD
     D["decide()"]
-    D -->|category NOT in [PROMOTIONAL, PROMOTION, SERVICE_EXPLICIT]| SKIP["skip → false"]
-    D -->|dltRequired==true AND dltPassed==false| SKIP
-    D -->|frequency_capping == '1'| SKIP
+    D -->|category not PROMOTIONAL, PROMOTION or SERVICE_EXPLICIT| SKIP["skip — false"]
+    D -->|dltRequired AND dltPassed==false| SKIP
+    D -->|frequency_capping == 1| SKIP
     D --> RUN["invoke()"]
 
-    RUN --> BUILD["CmsRequestBuilder.build(ctx)\n{cohortId=event.cohort or default.cms.cohort=3,\ncommunicationType, campaignId, ...}"]
-    BUILD --> CALL["POST {cms.url}\nAuthorization: Bearer {cms.access.token}\nHeaders: tenant_id, dept_id={workspace_id}, user_id"]
-    CALL --> RESP["CmsServiceResponse<CmsAppResponse>"]
+    RUN --> BUILD["CmsRequestBuilder.build\ncohortId = event.cohort or default 3\ncommunicationType, campaignId, ..."]
+    BUILD --> CALL["POST cms.url\nAuthorization: Bearer cms.access.token\nHeaders: tenant_id, dept_id=workspace_id, user_id"]
+    CALL --> RESP["CmsServiceResponse — CmsAppResponse"]
     RESP --> CHECK["ctx.cmsResponse stored\nctx.cmsResponseTime set"]
-    CHECK -->|communication==NOT_ALLOWED OR status==FAILURE| BLOCK["throw GenericException\n(COMMUNICATION_NOT_ALLOWED 4059)"]
-    CHECK -->|ALLOWED + SUCCESS| PASS["state.cmsPassed=true\ncontinue to builder"]
+    CHECK -->|communication NOT_ALLOWED or status FAILURE| BLOCK["throw GenericException\nCOMMUNICATION_NOT_ALLOWED 4059"]
+    CHECK -->|ALLOWED and SUCCESS| PASS["state.cmsPassed = true\ncontinue to builder"]
 
     classDef ext fill:#8e44ad,color:#fff,stroke:#6c3483
     classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
@@ -441,22 +441,22 @@ flowchart TD
     RBF["RequestBuilderFactory.getBuilder(channel)"]
 
     RBF -->|SMS| SRB["SmsRequestBuilder\nroutes by sms.provider enum"]
-    SRB -->|IQ| SIQ["SmsIQRequestBuilder\nBuilds SmsIQRequestDTO\n{entityId, customerId, siId, message, templateId, ...}"]
-    SRB -->|LOBBY| SLB["SmsLobbyRequestBuilder\nBuilds SmsLobbyRequestDTO\n{user, password, sid, msisdn, message, ...}"]
+    SRB -->|IQ| SIQ["SmsIQRequestBuilder\nSmsIQRequestDTO\nentityId, customerId, siId, message, templateId"]
+    SRB -->|LOBBY| SLB["SmsLobbyRequestBuilder\nSmsLobbyRequestDTO\nuser, password, sid, msisdn, message"]
 
     RBF -->|EMAIL| ERB["EmailRequestBuilder\nroutes by email.provider enum"]
-    ERB -->|NETCORE| NET["EmailNetcoreRequestBuilder\nBuilds EmailNetcoreRequestDTO\n{from, to, subject, htmlBody, attachments, ...}"]
-    ERB -->|SMTP| SMTP["EmailSmtpRequestBuilder\nBuilds EmailSmtpRequestDTO\n{from, to, subject, htmlBody, ...}"]
+    ERB -->|NETCORE| NET["EmailNetcoreRequestBuilder\nEmailNetcoreRequestDTO\nfrom, to, subject, htmlBody, attachments"]
+    ERB -->|SMTP| SMTP["EmailSmtpRequestBuilder\nEmailSmtpRequestDTO\nfrom, to, subject, htmlBody"]
 
-    RBF -->|WHATSAPP| WRB["WhatsAppRequestBuilder\nBuilds WhatsAppRequestDTO\n{to, from, templateId, variables, payload,\nmediaAttachment{id, type}, couponCode, suffix}"]
+    RBF -->|WHATSAPP| WRB["WhatsAppRequestBuilder\nWhatsAppRequestDTO\nto, from, templateId, variables, payload\nmediaAttachment id+type, couponCode, suffix"]
 
-    RBF -->|PUSH| PRB["PushRequestBuilder\nBuilds PushRequestDTO\n{projectId, strategy=LATEST, payload list}"]
+    RBF -->|PUSH| PRB["PushRequestBuilder\nPushRequestDTO\nprojectId, strategy=LATEST, payload list"]
 
-    RBF -->|RCS| RRB["RcsRequestBuilder\nBuilds RcsRequestDTO"]
+    RBF -->|RCS| RRB["RcsRequestBuilder\nRcsRequestDTO"]
 
-    RBF -->|D2C| DRB["D2CRequestBuilder\nBuilds List<D2CEventRequestDTO>\n{campaignDetails, lobData, ...}"]
+    RBF -->|D2C| DRB["D2CRequestBuilder\nList of D2CEventRequestDTO\ncampaignDetails, lobData"]
 
-    RBF -->|FS| FRB["FSRequestBuilder\nBuilds List<D2CEventRequestDTO>"]
+    RBF -->|FS| FRB["FSRequestBuilder\nList of D2CEventRequestDTO"]
 
     classDef svc fill:#2980b9,color:#fff,stroke:#1f618d
     classDef ext fill:#8e44ad,color:#fff,stroke:#6c3483
