@@ -27,13 +27,28 @@ Build, containerize, and deploy all 6 Bummlebee services.
 git clone https://code.airtelworld.in:7990/bitbucket/scm/uclm/uclm-rate-controller-service.git
 cd uclm-rate-controller-service
 mvn clean install
-# JAR output: target/rate-controller-service-1.0.0.jar
+# JAR output: target/rate-controller-service-*.jar
 ```
 
 ### Docker
 
 ```bash
 docker build --platform=linux/amd64 -t rate-controller-service:latest .
+# EXPOSE 8081 — service runs on server.port=8081
+```
+
+### Deployment Model
+
+One pod instance per `(workspace × channel × campaignType × category)` combination.
+The throttle key and all capacity checks are scoped to this 4-dimensional combination.
+
+Generate and apply all K8s manifests:
+```bash
+cd k8s/
+python3 generate-deployments.py      # creates 520 YAMLs in k8s/generated/
+./deploy-all.sh                      # generates + kubectl apply
+./deploy-all.sh --generate-only      # generate YAMLs only
+./deploy-all.sh --dry-run            # generate + dry-run apply
 ```
 
 ### Environment Variables (Key)
@@ -43,16 +58,24 @@ docker build --platform=linux/amd64 -t rate-controller-service:latest .
 | `SPRING_DATASOURCE_URL` | `spring.datasource.url` | PostgreSQL JDBC URL |
 | `SPRING_DATASOURCE_USERNAME` | `spring.datasource.username` | DB username |
 | `SPRING_DATASOURCE_PASSWORD` | `spring.datasource.password` | DB password |
-| `KAFKA_BOOTSTRAP_SERVERS` | `kafka.bootstrap.servers` | Kafka brokers |
-| `KAFKA_TOPIC` | `kafka.topic` | Input topic (`comms-input`) |
-| `KAFKA_DISPATCH_TOPIC` | `kafka.dispatch.topic` | Output topic (`event`) |
-| `CHANNEL_GLOBAL_TPS` | `channel.global.tps` | Global TPS limit |
-| `CHANNEL` | `channel` | Channel type |
+| `spring.kafka.bootstrap-servers` | `spring.kafka.bootstrap-servers` | Kafka brokers |
+| `input.kafka.topic` | `input.kafka.topic` | Input topic (unique per combination) |
+| `kafka.dispatch.topic` | `kafka.dispatch.topic` | Output topic (→ Validation Governance) |
+| `kafka.consumer.group-id` | `kafka.consumer.group-id` | Consumer group (unique per combination) |
+| `channel.name` | `channel.name` | Channel: SMS / EMAIL / WHATSAPP / PUSH / RCS |
+| `campaign.type` | `campaign.type` | Campaign type: NRT / SCHEDULED |
+| `category` | `category` | Category: SERVICE / PROMOTIONAL |
+| `channel.global.tps` | `channel.global.tps` | Global max TPS for the combination |
+| `tenant.id` | `tenant.id` | Tenant ID for this instance |
+| `team.id` | `team.id` | Workspace ID for this instance |
+| `downstream.valgov.consumer-group` | `downstream.valgov.consumer-group` | Lag-check group for Val-Gov |
+| `downstream.orch.consumer-group` | `downstream.orch.consumer-group` | Lag-check group for Orchestrator |
+| `downstream.max.allowed.lag` | `downstream.max.allowed.lag` | Max consumer lag threshold (default: 10000) |
 
 ### Run Local
 
 ```bash
-java -jar target/rate-controller-service-1.0.0.jar --spring.profiles.active=local
+java -jar target/rate-controller-service-*.jar --spring.profiles.active=local
 ```
 
 ---
@@ -265,23 +288,35 @@ kubectl apply -f deployment.yaml -n <namespace>
 ## Kafka Topic Setup
 
 ```bash
-# Delivery pipeline topics
-kafka-topics --create --topic comms-input --partitions 6 --replication-factor 3
-kafka-topics --create --topic event --partitions 6 --replication-factor 3
-kafka-topics --create --topic dispatch --partitions 6 --replication-factor 3
+# Rate controller input topics — one per (workspace × channel × campaignType × category)
+# Pattern: channel_partner_rate_controller_{workspace}_{channel}_{campaignType}_{category}_input
+# Example:
+kafka-topics --create --topic channel_partner_rate_controller_101_sms_nrt_service_input \
+  --partitions 6 --replication-factor 3
+
+# Validation Governance input topics (one per channel)
+kafka-topics --create --topic channel_partner_val_gov_sms_svc_input      --partitions 6 --replication-factor 3
+kafka-topics --create --topic channel_partner_val_gov_email_svc_input    --partitions 6 --replication-factor 3
+kafka-topics --create --topic channel_partner_val_gov_whatsapp_svc_input --partitions 6 --replication-factor 3
+kafka-topics --create --topic channel_partner_val_gov_push_svc_input     --partitions 6 --replication-factor 3
+kafka-topics --create --topic channel_partner_val_gov_rcs_svc_input      --partitions 6 --replication-factor 3
+
+# Other delivery pipeline topics
+kafka-topics --create --topic event      --partitions 6 --replication-factor 3
+kafka-topics --create --topic dispatch   --partitions 6 --replication-factor 3
+kafka-topics --create --topic exceptions --partitions 3 --replication-factor 3
 kafka-topics --create --topic cs_raw_reporting_topic --partitions 3 --replication-factor 3
 
 # Response / error topics
-kafka-topics --create --topic dispatch-response --partitions 3 --replication-factor 3
-kafka-topics --create --topic orchestrator-exceptions --partitions 3 --replication-factor 3
-kafka-topics --create --topic exceptions --partitions 3 --replication-factor 3
+kafka-topics --create --topic dispatch-response         --partitions 3 --replication-factor 3
+kafka-topics --create --topic orchestrator-exceptions   --partitions 3 --replication-factor 3
 
 # DLR topics
-kafka-topics --create --topic iq_channel_dlr_raw --partitions 6 --replication-factor 3
-kafka-topics --create --topic wa_main_service --partitions 6 --replication-factor 3
-kafka-topics --create --topic enriched-dlr-topic --partitions 6 --replication-factor 3
+kafka-topics --create --topic iq_channel_dlr_raw    --partitions 6 --replication-factor 3
+kafka-topics --create --topic wa_main_service        --partitions 6 --replication-factor 3
+kafka-topics --create --topic enriched-dlr-topic     --partitions 6 --replication-factor 3
 
 # DLQ topics
-kafka-topics --create --topic wa_main_service_dlq --partitions 3 --replication-factor 3
-kafka-topics --create --topic dlr-enricher-dlq --partitions 3 --replication-factor 3
+kafka-topics --create --topic wa_main_service_dlq  --partitions 3 --replication-factor 3
+kafka-topics --create --topic dlr-enricher-dlq     --partitions 3 --replication-factor 3
 ```
